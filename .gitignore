@@ -1,0 +1,4 @@
+all.txt
+.venv/
+__pycache__/
+*.pyc
