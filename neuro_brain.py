@@ -12,10 +12,12 @@ SEND_PORT = 5006     # To Unity (Command Channel)
 # --- NEURAL LAYER ---
 class NeuralEngine:
     def __init__(self):
-        self.model = IsolationForest(contamination=0.1) 
+        self.model = IsolationForest(contamination=0.01) # Very conservative
         self.is_trained = False
         self.scaler_max_speed = 1.0 
         self.scaler_max_vib = 1.0
+        self.anomaly_counter = 0 # To filter out transient noise
+
 
     def train(self, data_points):
         print("🧠 Neural Layer: Processing calibration data...")
@@ -34,22 +36,51 @@ class NeuralEngine:
 
     def detect_anomaly(self, speed, vibration):
         if not self.is_trained: return False
+        
+        # LOGIC GATE: If we are just stopped or moving slowly, IT IS NOT AN ANOMALY.
+        if speed < 5.0 and vibration < 0.1: # Increased vib tolerance for low speeds
+            self.anomaly_counter = 0
+            return False
+
         try:
-            return self.model.predict([[speed/self.scaler_max_speed, vibration/self.scaler_max_vib]])[0] == -1
+            is_anomaly = self.model.predict([[speed/self.scaler_max_speed, vibration/self.scaler_max_vib]])[0] == -1
+            if is_anomaly:
+                self.anomaly_counter += 1
+            else:
+                self.anomaly_counter = max(0, self.anomaly_counter - 1)
+            
+            # TRIGGER ONLY IF SUSTAINED (e.g. 10 frames = ~0.2s)
+            return self.anomaly_counter > 10
         except: return False 
 
 # --- SYMBOLIC LAYER (SAFETY RULES) ---
 class SymbolicEngine:
     def __init__(self):
         self.fault_counter = 0
+        self.last_valid_speed = 0.0
 
     def check_safety_rules(self, speed, vibration):
-        if speed < 1.0 and vibration > 0.02: 
+        # RULE 1: Physics Paradox (Stopped but vibrating)
+        # Reduced threshold slightly (0.05) to catch highway cruising failures
+        paradox = (speed < 1.0 and vibration > 0.05)
+        
+        # RULE 2: Impossible Deceleration (Instant Stop)
+        # If speed drops from >20km/h to 0 instantly, it's a sensor failure.
+        impossible_stop = False
+        if self.last_valid_speed > 20.0 and speed < 1.0:
+            impossible_stop = True
+            
+        # Update/Reset State
+        if speed > 1.0:
+            self.last_valid_speed = speed
+            self.fault_counter = 0
+        elif paradox or impossible_stop:
             self.fault_counter += 1
         else:
+             # Just a normal stop
             self.fault_counter = 0
 
-        if self.fault_counter > 3:
+        if self.fault_counter > 3: # Fast reaction (approx 0.05s)
             return "CRITICAL: Wheel Speed Sensor Failure (Signal Loss)"
         return None 
 
@@ -86,11 +117,21 @@ def start_neurodrive():
             
             if latest_data:
                 packet = json.loads(latest_data.decode())
-                if packet['wheel_speed_fl'] > 1.0:
-                    training_data.append([packet['wheel_speed_fl'], packet['vibration_level']])
+                # Use keys consistent with dashboard.py
+                current_speed = packet.get('speed', packet.get('wheel_speed_fl', 0))
+                current_vib = packet.get('vibration', packet.get('vibration_level', 0))
+                
+                if current_speed > 1.0:
+                    training_data.append([current_speed, current_vib])
                 print(f"Calibrating... {int(10 - (time.time() - start_time))}s", end='\r')
-        except: pass
+        except Exception as e:
+            # print(f"Error in calibration: {e}") 
+            pass
         time.sleep(0.01) 
+
+    # Phase 2: Knowledge Injection (Teach it that "Stopping" is also normal)
+    # Inject synthetic "safe" data points for low speed/low vibration
+    training_data.extend([[0.0, 0.001], [1.0, 0.002], [5.0, 0.005], [0.0, 0.0]]) 
 
     if len(training_data) < 5: training_data.extend([[10, 0.02], [50, 0.05]])
     brain.train(training_data)
@@ -112,9 +153,9 @@ def start_neurodrive():
                 continue
 
             packet = json.loads(latest_packet.decode())
-            speed = packet['wheel_speed_fl']
-            vib = packet['vibration_level']
-            status = packet['status']
+            speed = packet.get('speed', packet.get('wheel_speed_fl', 0))
+            vib = packet.get('vibration', packet.get('vibration_level', 0))
+            status = packet.get('status', 'UNKNOWN')
             
             # 1. Check for Rules
             rule_fault = logic.check_safety_rules(speed, vib)
@@ -143,11 +184,22 @@ def start_neurodrive():
                 # System detected the fix was successful
                 print(f"✅ SYSTEM RECOVERED | Virtual Speed: {speed:.1f} km/h (Sensor Bypassed)   ", end='\r')
                 
-            elif not rule_fault:
+            elif not rule_fault and not neural_fault:
                 print(f"✅ System Normal | Speed: {speed:.1f} | Vib: {vib:.3f}   ", end='\r')
-                # If everything is normal for a long time, we could reset the healing flag
-                if healing_triggered and speed > 1.0:
-                     healing_triggered = False # Ready for next fault
+                
+                # RECOVERY LOGIC: If we were healing, but now data is robustly healthy again
+                if healing_triggered and speed > 5.0:
+                     print(f"\n✨ FAULT CLEARED: Sensor Signal Restored.")
+                     print(f"    ⚡ ACTION: Deactivating Virtual Sensor...")
+                     
+                     # SEND RESET COMMAND TO UNITY
+                     try:
+                        # Use FAULT type with 0.0 to clear all faults (Signal Loss + Virtual Sensor)
+                        cmd = json.dumps({"type": "FAULT", "value1": 0.0, "value2": 0.0})
+                        sock_send.sendto(cmd.encode(), (UDP_IP, SEND_PORT))
+                     except: pass
+                     
+                     healing_triggered = False # Reset flag
                 
         except KeyboardInterrupt: break
         except Exception: pass
